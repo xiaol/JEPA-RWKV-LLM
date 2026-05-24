@@ -3,7 +3,8 @@ To JEPA Or Not To JEPA, That Is Le Question
 =============================================
 Ciprian-Florin Ifrim - 26 March 2026
 
-Architecture: Tokens -> Embedding -> [Mamba-2 SSM + ReLU²/SwiGLU MLP] × L (U-Net skips) -> RMSNorm -> h
+Architecture: Tokens -> Embedding -> [Mamba-2 SSM or RWKV-7 backbone + ReLU²/SwiGLU MLP] × L
+             (U-Net skips) -> RMSNorm -> h
     JEPA branch:  h -> Projector -> z -> Predictor (autoregressive rollout) -> MSE loss
     Decode branch: h -> [optional GELU adapter] -> tied/untied lm_head -> logits -> CE loss
     SIGReg:       z -> per-timestep Gaussian regularization (Epps-Pulley characteristic function test)
@@ -26,6 +27,8 @@ import os
 import random
 import sys
 import time
+import warnings
+from functools import lru_cache
 from pathlib import Path
 import numpy as np
 try:
@@ -39,9 +42,18 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # ---------------------------------------------------------------------------
-# Mamba-2 (requires mamba_ssm package with CUDA kernels)
+# Backbone kernels
 # ---------------------------------------------------------------------------
-from mamba_ssm import Mamba2
+try:
+    from mamba_ssm import Mamba2
+except Exception:
+    Mamba2 = None
+
+try:
+    from torch.utils.cpp_extension import CUDA_HOME, load as load_cpp_extension
+except Exception:
+    CUDA_HOME = None
+    load_cpp_extension = None
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
@@ -65,6 +77,10 @@ class Hyperparameters:
     # Model
     model_dim      = _e("MODEL_DIM", 512, int)
     num_layers     = _e("NUM_LAYERS", 12, int)
+    backbone       = _e("BACKBONE", "mamba2")       # "mamba2" or "rwkv7"
+    rwkv_head_size = _e("RWKV_HEAD_SIZE", 64, int)
+    rwkv_backend   = _e("RWKV_BACKEND", "auto")     # "auto", "cuda", or "torch"
+    rwkv_chunk_len = _e("RWKV_CHUNK_LEN", 16, int)
     d_state        = _e("D_STATE", 64, int)
     d_conv         = _e("D_CONV", 4, int)
     expand         = _e("EXPAND", 2, int)
@@ -89,6 +105,7 @@ class Hyperparameters:
     # Training
     train_seq_len  = _e("TRAIN_SEQ_LEN", 4096, int)
     train_batch_tokens = _e("TRAIN_BATCH_TOKENS", 524288, int)
+    grad_accum_steps = _e("GRAD_ACCUM_STEPS", 0, int)  # 0 = auto, 8/world_size
     iterations     = _e("ITERATIONS", 10000, int)
     warmup_steps   = _e("WARMUP_STEPS", 10, int)
     warmdown_fraction = _e("WARMDOWN_FRACTION", 0.15, float)
@@ -121,6 +138,7 @@ class Hyperparameters:
     sliding_batch_size = _e("SLIDING_BATCH_SIZE", 64, int)
     temp_scaling   = _e("TEMP_SCALING", 1, bool)
     temp_calib     = _e("TEMP_CALIB", 0.0, float)   # 0 = grid-search, >0 = use this temperature directly
+    skip_post_eval = _e("SKIP_POST_EVAL", 0, bool)
     compile_mode   = _e("COMPILE_MODE", "default")
     # Checkpoint
     checkpoint_every = _e("CHECKPOINT_EVERY", 0, int)   # 0 = disabled
@@ -258,6 +276,336 @@ class SSMBlock(nn.Module):
         return x
 
 
+def _ortho_init(x, scale):
+    with torch.no_grad():
+        shape = x.shape
+        if len(shape) == 2:
+            gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1
+            nn.init.orthogonal_(x, gain=gain * scale)
+        elif len(shape) == 3:
+            gain = math.sqrt(shape[1] / shape[2]) if shape[1] > shape[2] else 1
+            for i in range(shape[0]):
+                nn.init.orthogonal_(x[i], gain=gain * scale)
+        else:
+            raise ValueError(f"Unsupported tensor shape for orthogonal init: {shape}")
+        return x
+
+
+def _pad_time(x, pad_len):
+    if pad_len == 0:
+        return x
+    return F.pad(x, (0, 0, 0, pad_len))
+
+
+class _WindBackstepping(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, w, q, k, v, z, b, chunk_len):
+        B, T, H, C = w.shape
+        if T % chunk_len != 0:
+            raise ValueError(f"RWKV-7 CUDA sequence length {T} is not divisible by {chunk_len}")
+        if not all(i.dtype == torch.float32 for i in [w, q, k, v, z, b]):
+            raise TypeError("The upstream RWKV-7 wind_backstepping op currently expects fp32 inputs")
+
+        w, q, k, v, z, b = [i.contiguous() for i in [w, q, k, v, z, b]]
+        y = torch.empty_like(v)
+        s = torch.empty(B, H, T // chunk_len, C, C, dtype=torch.float32, device=w.device)
+        sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
+        torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa)
+        ctx.save_for_backward(w, q, k, v, z, b, s, sa)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        dy = dy.contiguous()
+        w, q, k, v, z, b, s, sa = ctx.saved_tensors
+        dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
+        torch.ops.wind_backstepping.backward(w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db)
+        return dw, dq, dk, dv, dz, db, None
+
+
+@lru_cache(maxsize=None)
+def _load_wind_backstepping(head_size, chunk_len):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+    if hasattr(torch.ops.wind_backstepping, "forward"):
+        return
+    if load_cpp_extension is None:
+        raise RuntimeError("torch.utils.cpp_extension.load is unavailable")
+    if CUDA_HOME is None:
+        raise RuntimeError("CUDA toolkit was not found; install nvcc and set CUDA_HOME")
+
+    source_dir = Path(os.environ.get("RWKV7_CUDA_SOURCE_DIR", Path(__file__).resolve().parent / "cuda"))
+    sources = [source_dir / "wkv7_cuda_fp32.cu", source_dir / "wkv7_op_fp32.cpp"]
+    missing = [str(path) for path in sources if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Missing RWKV-7 CUDA source file(s): {', '.join(missing)}")
+
+    flags = [
+        "-res-usage",
+        f"-D_C_={head_size}",
+        f"-D_CHUNK_LEN_={chunk_len}",
+        "--use_fast_math",
+        "-O3",
+        "-Xptxas",
+        "-O3",
+        "--extra-device-vectorization",
+    ]
+    load_cpp_extension(
+        name=f"wind_backstepping_h{head_size}_c{chunk_len}",
+        sources=[str(path) for path in sources],
+        is_python_module=False,
+        verbose=os.environ.get("RWKV7_CUDA_VERBOSE", "0") == "1",
+        extra_cuda_cflags=flags,
+    )
+    if not hasattr(torch.ops.wind_backstepping, "forward"):
+        raise RuntimeError("RWKV-7 CUDA extension loaded, but torch.ops.wind_backstepping.forward is unavailable")
+
+
+def rwkv7_recurrence_torch(r, w, k, v, a, b, head_size):
+    B, T, C = r.shape
+    H = C // head_size
+    dtype = r.dtype
+
+    r = r.view(B, T, H, head_size)
+    k = k.view(B, T, H, head_size)
+    v = v.view(B, T, H, head_size)
+    a = a.view(B, T, H, head_size)
+    b = b.view(B, T, H, head_size)
+    decay = torch.exp(-torch.exp(w.float()))
+    decay = decay.view(B, T, H, head_size)
+
+    state = torch.zeros(B, H, head_size, head_size, device=r.device, dtype=torch.float32)
+    out = []
+    for t in range(T):
+        rt = r[:, t].float()
+        kt = k[:, t].float()
+        vt = v[:, t].float()
+        at = a[:, t].float()
+        bt = b[:, t].float()
+        wt = decay[:, t]
+
+        sa = (state * at.unsqueeze(-2)).sum(dim=-1)
+        state = (
+            state * wt.unsqueeze(-2)
+            + vt.unsqueeze(-1) * kt.unsqueeze(-2)
+            + sa.unsqueeze(-1) * bt.unsqueeze(-2)
+        )
+        out.append((state * rt.unsqueeze(-2)).sum(dim=-1).to(dtype))
+
+    return torch.stack(out, dim=1).reshape(B, T, C)
+
+
+def rwkv7_recurrence_cuda(r, w, k, v, a, b, head_size, chunk_len):
+    _load_wind_backstepping(head_size, chunk_len)
+
+    B, T, C = r.shape
+    H = C // head_size
+    pad_len = (-T) % chunk_len
+    T_padded = T + pad_len
+
+    q, w, k, v, a, b = [
+        _pad_time(t, pad_len).float().view(B, T_padded, H, head_size).contiguous()
+        for t in [r, w, k, v, a, b]
+    ]
+    out = _WindBackstepping.apply(w, q, k, v, a, b, chunk_len)
+    return out.reshape(B, T_padded, C)[:, :T].to(r.dtype)
+
+
+def rwkv7_recurrence(r, w, k, v, a, b, head_size, backend="auto", chunk_len=16):
+    if backend not in {"auto", "cuda", "torch"}:
+        raise ValueError(f"Unknown RWKV-7 backend: {backend}")
+    if backend == "torch" or not r.is_cuda:
+        return rwkv7_recurrence_torch(r, w, k, v, a, b, head_size)
+
+    try:
+        return rwkv7_recurrence_cuda(r, w, k, v, a, b, head_size, chunk_len)
+    except Exception as exc:
+        if backend == "cuda":
+            raise RuntimeError(
+                "RWKV-7 CUDA backend is unavailable. Install the CUDA toolkit with "
+                "nvcc, set CUDA_HOME if needed, and keep the upstream "
+                "wind_backstepping sources under ./cuda or RWKV7_CUDA_SOURCE_DIR."
+            ) from exc
+        warnings.warn(
+            f"Falling back to the slow PyTorch RWKV-7 recurrence because the native "
+            f"wind_backstepping op is unavailable: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return rwkv7_recurrence_torch(r, w, k, v, a, b, head_size)
+
+
+class RWKV7TimeMix(nn.Module):
+    """RWKV-7 x070 time-mix block adapted from blinkdl/rwkv-lm."""
+
+    def __init__(self, dim, depth, layer_id, head_size=64, backend="auto", chunk_len=16):
+        super().__init__()
+        assert dim % head_size == 0, "hidden_dim must be divisible by RWKV head_size"
+        if backend not in {"auto", "cuda", "torch"}:
+            raise ValueError(f"Unknown RWKV-7 backend: {backend}")
+        self.layer_id = layer_id
+        self.head_size = head_size
+        self.n_head = dim // head_size
+        self.backend = backend
+        self.chunk_len = chunk_len
+
+        ratio_0_to_1 = layer_id / max(depth - 1, 1)
+        ratio_1_to_almost0 = 1.0 - (layer_id / depth)
+        ddd = torch.arange(dim, dtype=torch.float32) / dim
+
+        self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+        self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+        self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+        self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+        self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+        self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+
+        linear = torch.arange(dim, dtype=torch.float32) / (dim - 1) - 0.5
+        zigzag = (torch.arange(dim, dtype=torch.float32) % head_size)
+        zigzag = (zigzag - ((head_size - 1) / 2)) / ((head_size - 1) / 2)
+        zigzag = zigzag * zigzag.abs()
+        decay = -6 + 6 * (torch.arange(dim, dtype=torch.float32) / (dim - 1)) ** (
+            1 + ratio_0_to_1**0.3
+        )
+
+        decay_lora_dim = max(32, int(round((2.5 * (dim**0.5)) / 32) * 32))
+        aaa_lora_dim = max(32, int(round((2.5 * (dim**0.5)) / 32) * 32))
+        gate_lora_dim = max(32, int(round((5 * (dim**0.5)) / 32) * 32))
+
+        self.w1 = nn.Parameter(torch.zeros(dim, decay_lora_dim))
+        self.w2 = nn.Parameter(_ortho_init(torch.zeros(decay_lora_dim, dim), 0.1))
+        self.w0 = nn.Parameter(decay + 0.5 + zigzag * 2.5)
+
+        self.a1 = nn.Parameter(torch.zeros(dim, aaa_lora_dim))
+        self.a2 = nn.Parameter(_ortho_init(torch.zeros(aaa_lora_dim, dim), 0.1))
+        self.a0 = nn.Parameter(torch.zeros(dim) - 0.19 + zigzag * 0.3 + linear * 0.4)
+
+        if layer_id > 0:
+            mv_lora_dim = max(32, int(round((1.7 * (dim**0.5)) / 32) * 32))
+            self.v1 = nn.Parameter(torch.zeros(dim, mv_lora_dim))
+            self.v2 = nn.Parameter(_ortho_init(torch.zeros(mv_lora_dim, dim), 0.1))
+            self.v0 = nn.Parameter(torch.zeros(dim) + 0.73 - linear * 0.4)
+
+        self.g1 = nn.Parameter(torch.zeros(dim, gate_lora_dim))
+        self.g2 = nn.Parameter(_ortho_init(torch.zeros(gate_lora_dim, dim), 0.1))
+
+        self.k_k = nn.Parameter(torch.zeros(dim) + 0.71 - linear * 0.1)
+        self.k_a = nn.Parameter(torch.zeros(dim) + 1.02)
+        self.r_k = nn.Parameter(torch.zeros(self.n_head, head_size) - 0.04)
+
+        self.receptance = nn.Linear(dim, dim, bias=False)
+        self.key = nn.Linear(dim, dim, bias=False)
+        self.value = nn.Linear(dim, dim, bias=False)
+        self.output = nn.Linear(dim, dim, bias=False)
+        self.ln_x = nn.GroupNorm(self.n_head, dim, eps=64e-5)
+
+        self.receptance.weight.data.uniform_(-0.5 / (dim**0.5), 0.5 / (dim**0.5))
+        self.key.weight.data.uniform_(-0.05 / (dim**0.5), 0.05 / (dim**0.5))
+        self.value.weight.data.uniform_(-0.5 / (dim**0.5), 0.5 / (dim**0.5))
+        self.output.weight.data.zero_()
+
+    def forward(self, x, v_first):
+        B, T, C = x.size()
+        xx = F.pad(x, (0, 0, 1, -1)) - x
+
+        xr = x + xx * self.x_r.view(1, 1, -1)
+        xw = x + xx * self.x_w.view(1, 1, -1)
+        xk = x + xx * self.x_k.view(1, 1, -1)
+        xv = x + xx * self.x_v.view(1, 1, -1)
+        xa = x + xx * self.x_a.view(1, 1, -1)
+        xg = x + xx * self.x_g.view(1, 1, -1)
+
+        r = self.receptance(xr)
+        w = self.w0.view(1, 1, -1) + torch.tanh(xw @ self.w1) @ self.w2
+        k = self.key(xk)
+        v = self.value(xv)
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            v = v + (v_first - v) * torch.sigmoid(self.v0.view(1, 1, -1) + (xv @ self.v1) @ self.v2)
+
+        w = -F.softplus(-w) - 0.5
+        a = torch.sigmoid(self.a0.view(1, 1, -1) + (xa @ self.a1) @ self.a2)
+        g = torch.sigmoid(xg @ self.g1) @ self.g2
+
+        kk = k * self.k_k.view(1, 1, -1)
+        kk = F.normalize(kk.view(B, T, self.n_head, self.head_size), dim=-1, p=2.0).view(B, T, C)
+        k = k * (1 + (a - 1) * self.k_a.view(1, 1, -1))
+
+        x = rwkv7_recurrence(
+            r,
+            w,
+            k,
+            v,
+            -kk,
+            kk * a,
+            self.head_size,
+            backend=self.backend,
+            chunk_len=self.chunk_len,
+        )
+        x = self.ln_x(x.reshape(B * T, C)).view(B, T, C)
+        x = x + (
+            (r.view(B, T, self.n_head, self.head_size) * k.view(B, T, self.n_head, self.head_size) * self.r_k)
+            .sum(dim=-1, keepdim=True)
+            * v.view(B, T, self.n_head, self.head_size)
+        ).view(B, T, C)
+        return self.output(x * g), v_first
+
+
+class RWKV7ChannelMix(nn.Module):
+    def __init__(self, dim, depth, layer_id, ffn_dim=None):
+        super().__init__()
+        ratio_1_to_almost0 = 1.0 - (layer_id / depth)
+        ddd = torch.arange(dim, dtype=torch.float32) / dim
+        self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+
+        ffn_dim = ffn_dim or int((dim * 3.5) // 32 * 32)
+        self.key = nn.Linear(dim, ffn_dim, bias=False)
+        self.value = nn.Linear(ffn_dim, dim, bias=False)
+
+        self.key.weight.data.uniform_(-0.5 / (dim**0.5), 0.5 / (dim**0.5))
+        self.value.weight.data.zero_()
+
+    def forward(self, x):
+        xx = F.pad(x, (0, 0, 1, -1)) - x
+        k = x + xx * self.x_k.view(1, 1, -1)
+        k = torch.relu(self.key(k)) ** 2
+        return self.value(k)
+
+
+class RWKV7Block(nn.Module):
+    def __init__(self, dim, depth, layer_id, head_size=64, ffn_dim=None, backend="auto", chunk_len=16):
+        super().__init__()
+        self.layer_id = layer_id
+        if layer_id == 0:
+            self.ln0 = nn.LayerNorm(dim)
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+        self.att = RWKV7TimeMix(
+            dim,
+            depth,
+            layer_id,
+            head_size=head_size,
+            backend=backend,
+            chunk_len=chunk_len,
+        )
+        self.ffn = RWKV7ChannelMix(dim, depth, layer_id, ffn_dim=ffn_dim) if ffn_dim is not None else None
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.ffn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if self.ffn is not None else None
+
+    def forward(self, x, x0, v_first):
+        if self.layer_id == 0:
+            x = self.ln0(x)
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0].view(1, 1, -1) * x + mix[1].view(1, 1, -1) * x0
+        x_attn, v_first = self.att(self.ln1(x), v_first)
+        x = x + self.attn_scale.to(dtype=x.dtype).view(1, 1, -1) * x_attn
+        if self.ffn is not None:
+            x = x + self.ffn_scale.to(dtype=x.dtype).view(1, 1, -1) * self.ffn(self.ln2(x))
+        return x, v_first
+
+
 # ---------------------------------------------------------------------------
 # ByteJEPA — the core model (aligned with LeWorldModel, Maes et al. 2026)
 # ---------------------------------------------------------------------------
@@ -276,10 +624,10 @@ class ProjectorMLP(nn.Module):
 
 class ByteJEPA(nn.Module):
     """
-    Byte-level JEPA with SSM backbone, aligned with LeWorldModel (Maes et al. 2026).
+    Byte-level JEPA with selectable SSM or RWKV-7 backbone, aligned with LeWorldModel (Maes et al. 2026).
 
     Architecture:
-        Encoder:    tokens -> token_embed [-> embed_proj] -> RMSNorm -> [SSM+MLP blocks w/ U-Net skips] -> RMSNorm -> h
+        Encoder:    tokens -> token_embed [-> embed_proj] -> RMSNorm -> [backbone+MLP blocks w/ U-Net skips] -> RMSNorm -> h
         Projector:  h -> z (linear or MLP, for JEPA prediction space)
         Predictor:  z_t -> predicted z_{t+k} (multi-step latent prediction)
         Pred_proj:  predictor output -> same space as projector
@@ -291,6 +639,8 @@ class ByteJEPA(nn.Module):
                  mlp_mult: int = 3, mlp_every: int = 1, activation: str = "relu2",
                  tie_embeddings: int = 0, projector_type: str = "linear",
                  jepa_steps: int = 1, logit_softcap: float = 15.0,
+                 backbone: str = "mamba2", rwkv_head_size: int = 64,
+                 rwkv_backend: str = "auto", rwkv_chunk_len: int = 16,
                  softcap_type: str = "poly"):
         super().__init__()
         self.vocab_size = vocab_size
@@ -299,6 +649,10 @@ class ByteJEPA(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
         self.softcap_type = softcap_type
+        self.backbone = backbone
+        self.rwkv_head_size = rwkv_head_size
+        self.rwkv_backend = rwkv_backend
+        self.rwkv_chunk_len = rwkv_chunk_len
         embed_dim = embed_dim if embed_dim > 0 else model_dim
         self._embed_dim = embed_dim
 
@@ -322,13 +676,34 @@ class ByteJEPA(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
-        # SSM encoder backbone (mlp_every controls which blocks get MLP: 1=all, 2=alternate, etc.)
-        self.blocks = nn.ModuleList([
-            SSMBlock(model_dim, d_state, d_conv, expand,
-                     mlp_mult if (mlp_every > 0 and i % mlp_every == 0) else 0,
-                     activation)
-            for i in range(num_layers)
-        ])
+        # Selectable encoder backbone.
+        # "mamba2" keeps the original SSM blocks.
+        # "rwkv7" swaps the sequence mixer for RWKV-7 while keeping the same MLP schedule.
+        if backbone == "mamba2":
+            self.blocks = nn.ModuleList([
+                SSMBlock(model_dim, d_state, d_conv, expand,
+                         mlp_mult if (mlp_every > 0 and i % mlp_every == 0) else 0,
+                         activation)
+                for i in range(num_layers)
+            ])
+        elif backbone == "rwkv7":
+            if model_dim % rwkv_head_size != 0:
+                raise ValueError("MODEL_DIM must be divisible by RWKV_HEAD_SIZE")
+            self.blocks = nn.ModuleList([
+                RWKV7Block(
+                    model_dim,
+                    num_layers,
+                    i,
+                    head_size=rwkv_head_size,
+                    ffn_dim=(int((model_dim * mlp_mult) // 32 * 32)
+                             if (mlp_mult > 0 and i % mlp_every == 0) else None),
+                    backend=rwkv_backend,
+                    chunk_len=rwkv_chunk_len,
+                )
+                for i in range(num_layers)
+            ])
+        else:
+            raise ValueError(f"Unknown BACKBONE={backbone}")
         self.norm = RMSNorm()
 
         # Projector: h -> z (JEPA prediction space)
@@ -413,14 +788,25 @@ class ByteJEPA(nn.Module):
 
         # U-Net style encoder/decoder with skip connections
         skips = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
-            x = self.blocks[bi](x, x0)
+        if self.backbone == "mamba2":
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                bi = self.num_encoder_layers + i
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
+                x = self.blocks[bi](x, x0)
+        else:
+            v_first = torch.empty_like(x)
+            for i in range(self.num_encoder_layers):
+                x, v_first = self.blocks[i](x, x0, v_first)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                bi = self.num_encoder_layers + i
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
+                x, v_first = self.blocks[bi](x, x0, v_first)
 
         return self.norm(x)
 
@@ -603,6 +989,27 @@ class TokenStream:
         self.data = load_shard(self.files[self.file_idx], self.byte_mode)
         self.pos = 0
 
+    def state_dict(self) -> dict[str, int]:
+        return {"file_idx": self.file_idx, "pos": self.pos}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        if not state:
+            return
+        self.file_idx = int(state.get("file_idx", 0)) % len(self.files)
+        self.data = load_shard(self.files[self.file_idx], self.byte_mode)
+        self.pos = max(0, min(int(state.get("pos", 0)), self.data.numel()))
+
+    def advance(self, n: int) -> None:
+        remaining = int(n)
+        while remaining > 0:
+            avail = self.data.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(remaining, avail)
+            self.pos += k
+            remaining -= k
+
     def take(self, n: int) -> Tensor:
         chunks = []
         remaining = n
@@ -623,6 +1030,21 @@ class DistributedTokenLoader:
                  byte_mode: bool = True):
         self.rank, self.world_size, self.device = rank, world_size, device
         self.stream = TokenStream(pattern, byte_mode)
+
+    def state_dict(self) -> dict[str, dict[str, int]]:
+        return {"stream": self.stream.state_dict()}
+
+    def load_state_dict(self, state: dict[str, dict[str, int]]) -> None:
+        if state and "stream" in state:
+            self.stream.load_state_dict(state["stream"])
+
+    def advance_tokens(self, n: int) -> None:
+        self.stream.advance(n)
+
+    def advance_to_step(self, step: int, global_tokens: int, grad_accum_steps: int) -> None:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        self.advance_tokens(step * per_rank_span * self.world_size * grad_accum_steps)
 
     def next_batch(self, global_tokens: int, seq_len: int,
                    grad_accum_steps: int) -> tuple[Tensor, Tensor]:
@@ -805,7 +1227,8 @@ def jepa_diagnostics(model: nn.Module, val_tokens: Tensor, device: torch.device,
             cos_sims.append(cos.mean().item())
             jepa_mses.append((pred_z - target_z).pow(2).mean().item())
             h_f = h[0].float()
-            logits = base._get_logits(h[0])                  # keep bfloat16 for model layers
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base._get_logits(h[0])              # keep bfloat16 for model layers
             targets = yi[0]
             preds = logits.argsort(dim=-1, descending=True)
             lm_top1 += (preds[:, :1] == targets.unsqueeze(1)).any(1).sum().item()
@@ -886,7 +1309,9 @@ def _latest_checkpoint(checkpoint_dir: str) -> str | None:
     return ckpts[-1] if ckpts else None
 
 def save_checkpoint(checkpoint_dir: str, step: int, base_model: nn.Module,
-                    optimizers: list, training_time_ms: float) -> None:
+                    optimizers: list, training_time_ms: float,
+                    sigreg: nn.Module | None = None,
+                    train_loader: DistributedTokenLoader | None = None) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     path = _ckpt_path(checkpoint_dir, step)
     payload = {
@@ -896,20 +1321,31 @@ def save_checkpoint(checkpoint_dir: str, step: int, base_model: nn.Module,
         "optimizers": [o.state_dict() for o in optimizers],
         "rng_cpu": torch.get_rng_state(),
         "rng_cuda": torch.cuda.get_rng_state(),
-        "sigreg": sigreg.state_dict(),
     }
+    if sigreg is not None:
+        payload["sigreg"] = sigreg.state_dict()
+    if train_loader is not None:
+        payload["train_loader"] = train_loader.state_dict()
     tmp = path + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, path)   # atomic on POSIX
 
 def load_checkpoint(path: str, base_model: nn.Module, optimizers: list,
-                    device: torch.device, sigreg: nn.Module | None = None) -> tuple[int, float]:
+                    device: torch.device, sigreg: nn.Module | None = None,
+                    train_loader: DistributedTokenLoader | None = None,
+                    train_batch_tokens: int | None = None,
+                    grad_accum_steps: int | None = None) -> tuple[int, float]:
     payload = torch.load(path, map_location=device, weights_only=False)
     base_model.load_state_dict(payload["model"], strict=True)
     for opt, sd in zip(optimizers, payload["optimizers"]):
         opt.load_state_dict(sd)
     if sigreg is not None and "sigreg" in payload:
         sigreg.load_state_dict(payload["sigreg"])
+    if train_loader is not None:
+        if "train_loader" in payload:
+            train_loader.load_state_dict(payload["train_loader"])
+        elif train_batch_tokens is not None and grad_accum_steps is not None:
+            train_loader.advance_to_step(int(payload["step"]), train_batch_tokens, grad_accum_steps)
     torch.set_rng_state(payload["rng_cpu"].cpu())
     torch.cuda.set_rng_state(payload["rng_cuda"].cpu())
     return payload["step"], payload["training_time_ms"]
@@ -1189,7 +1625,7 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    grad_accum_steps = max(1, 8 // world_size)
+    grad_accum_steps = args.grad_accum_steps if args.grad_accum_steps > 0 else max(1, 8 // world_size)
     grad_scale = 1.0 / grad_accum_steps
 
     if not torch.cuda.is_available():
@@ -1245,6 +1681,10 @@ def main() -> None:
         vocab_size=args.vocab_size,
         model_dim=args.model_dim,
         num_layers=args.num_layers,
+        backbone=args.backbone,
+        rwkv_head_size=args.rwkv_head_size,
+        rwkv_backend=args.rwkv_backend,
+        rwkv_chunk_len=args.rwkv_chunk_len,
         d_state=args.d_state,
         d_conv=args.d_conv,
         expand=args.expand,
@@ -1263,7 +1703,7 @@ def main() -> None:
     # Promote scalars and small params to float32 (matching ternary code pattern).
     # EXCEPTION: Mamba2's internal conv1d and SSM params must stay bfloat16 because
     # the causal_conv1d CUDA kernel requires weight and bias to have matching dtype.
-    _mamba_internal = (".ssm.",)
+    _mamba_internal = (".ssm.",) if args.backbone == "mamba2" else ()
     for name, param in base_model.named_parameters():
         if any(mi in name for mi in _mamba_internal):
             continue  # leave Mamba2 internals in bfloat16
@@ -1316,6 +1756,7 @@ def main() -> None:
         weight_decay=args.adam_wd, fused=True)
 
     optimizers = [opt_muon, opt_scalar, opt_embed]
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, byte_mode)
 
     # --- Checkpoint resume ---
     _resume_step = 0
@@ -1325,7 +1766,10 @@ def main() -> None:
         if ckpt is not None:
             log0(f"checkpoint found: {ckpt}")
             _resume_step, _resume_training_ms = load_checkpoint(
-                ckpt, base_model, optimizers, device, sigreg=sigreg)
+                ckpt, base_model, optimizers, device, sigreg=sigreg,
+                train_loader=train_loader,
+                train_batch_tokens=args.train_batch_tokens,
+                grad_accum_steps=grad_accum_steps)
             log0(f"checkpoint loaded, starting from step {_resume_step} "
                  f"(accumulated_train_time:{_resume_training_ms:.0f}ms)")
         else:
@@ -1345,7 +1789,7 @@ def main() -> None:
         if not _is_training_only(n)
     )
     log0(f"ByteJEPA | params:{n_params:,} (eval:{n_eval:,} train_only:{n_train_only:,}) "
-         f"L:{args.num_layers} d:{args.model_dim} dS:{args.d_state} expand:{args.expand} "
+         f"backbone:{args.backbone} L:{args.num_layers} d:{args.model_dim} dS:{args.d_state} expand:{args.expand} "
          f"tok:{args.tokenizer} V:{args.vocab_size} ws:{world_size} ga:{grad_accum_steps} s:{args.seed}")
     log0(f"JEPA: jepa_w={args.jepa_weight} sigreg_l={args.sigreg_lambda} ce_w={args.ce_weight} "
          f"steps={args.jepa_steps} detach={args.detach_targets} "
@@ -1353,9 +1797,6 @@ def main() -> None:
          f"tie={args.tie_embeddings} qat={args.qat_fraction} int{args.quant_bits} fp={args.fp_storage} "
          f"softcap={args.logit_softcap} ({args.softcap_type})")
     log0(f"est_raw:{est_bytes/1e6:.1f}MB (pre-compression) budget:16.00MB")
-
-    # --- Data loader ---
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, byte_mode)
 
     def zero_grad_all():
         for opt in optimizers:
@@ -1454,7 +1895,7 @@ def main() -> None:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         # Validation
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if (not args.skip_post_eval) and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(args, model, rank, world_size, device,
@@ -1557,7 +1998,8 @@ def main() -> None:
 
         # Checkpoint save
         if master and args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
-            save_checkpoint(args.checkpoint_dir, step, base_model, optimizers, approx_ms)
+            save_checkpoint(args.checkpoint_dir, step, base_model, optimizers, approx_ms,
+                             sigreg=sigreg, train_loader=train_loader)
             log0(f"step:{step} checkpoint saved to {_ckpt_path(args.checkpoint_dir, step)}")
 
         # QAT start notification (once)
@@ -1581,15 +2023,15 @@ def main() -> None:
             if reached:
                 stop_after_step = step
 
-    # --- JEPA diagnostics (BEFORE serialization — projector/predictor are discarded from artifact) ---
-    if master:
+    # --- JEPA diagnostics and final eval (optional for benchmark-only runs) ---
+    if master and not args.skip_post_eval:
         diag = jepa_diagnostics(model, val_tokens, device, seq_len=args.train_seq_len)
         log0(f"jepa_diagnostics cos_sim:{diag['jepa_cos_sim']:.4f} jepa_mse:{diag['jepa_mse']:.4f} "
              f"lm_top1:{diag['lm_top1']:.4f} lm_top5:{diag['lm_top5']:.4f} "
              f"lm_top10:{diag['lm_top10']:.4f} probe_bpb:{diag['probe_bpb']:.4f}")
 
     # --- Serialization (QAT already applied during training) ---
-    if master:
+    if master and not args.skip_post_eval:
         log0("--- Compression ---")
         method, model_bytes, code_bytes, stats = save_model_quantized(
             base_model, code, "final_model", bits=args.quant_bits, fp_storage=args.fp_storage)
@@ -1603,55 +2045,58 @@ def main() -> None:
              f"= {total/1e6:.2f}/16.00MB {'FITS' if total <= 16_000_000 else 'OVER'}")
 
     # --- Roundtrip evaluation ---
-    if distributed:
-        dist.barrier()
+    if not args.skip_post_eval:
+        if distributed:
+            dist.barrier()
 
-    candidates = sorted(glob.glob("final_model.*.ptz"))
-    load_path = candidates[0] if candidates else "final_model.lzma.ptz"
-    load_model_quantized(load_path, base_model, device)
-    torch._dynamo.reset()
+        candidates = sorted(glob.glob("final_model.*.ptz"))
+        load_path = candidates[0] if candidates else "final_model.lzma.ptz"
+        load_model_quantized(load_path, base_model, device)
+        torch._dynamo.reset()
 
-    q_loss, q_bpb = eval_val(args, model, rank, world_size, device,
-                              val_tokens, bpe_luts=bpe_luts)
-    log0(f"final_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
+        q_loss, q_bpb = eval_val(args, model, rank, world_size, device,
+                                  val_tokens, bpe_luts=bpe_luts)
+        log0(f"final_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
 
-    # Temperature scaling through auto-calibration or fixed value
-    opt_temp = 1.0
-    if args.temp_scaling:
-        torch.cuda.synchronize()
-        t_temp = time.perf_counter()
-        if args.temp_calib > 0:
-            opt_temp = args.temp_calib
-        else:
-            # Auto-calibrate on training data
-            calib_tokens = train_loader.stream.take(65536)
-            u = ((calib_tokens.numel() - 1) // args.train_seq_len) * args.train_seq_len
-            calib_tokens = calib_tokens[:u + 1]
-            opt_temp = find_best_temperature(args, model, rank, world_size,
-                                             device, calib_tokens, bpe_luts=bpe_luts)
-        torch.cuda.synchronize()
-        log0(f"temp_scaling optimal_T:{opt_temp:.2f} "
-             f"{'(manual)' if args.temp_calib > 0 else '(auto)'} "
-             f"time:{1000.0 * (time.perf_counter() - t_temp):.0f}ms")
-        
-        # Final eval with optimal temperature
-        t_loss, t_bpb = eval_val(args, model, rank, world_size, device,
-                                  val_tokens, temperature=opt_temp, bpe_luts=bpe_luts)
-        log0(f"final_temped val_loss:{t_loss:.4f} val_bpb:{t_bpb:.4f} T={opt_temp:.2f}")
+        # Temperature scaling through auto-calibration or fixed value
+        opt_temp = 1.0
+        if args.temp_scaling:
+            torch.cuda.synchronize()
+            t_temp = time.perf_counter()
+            if args.temp_calib > 0:
+                opt_temp = args.temp_calib
+            else:
+                # Auto-calibrate on training data
+                calib_tokens = train_loader.stream.take(65536)
+                u = ((calib_tokens.numel() - 1) // args.train_seq_len) * args.train_seq_len
+                calib_tokens = calib_tokens[:u + 1]
+                opt_temp = find_best_temperature(args, model, rank, world_size,
+                                                 device, calib_tokens, bpe_luts=bpe_luts)
+            torch.cuda.synchronize()
+            log0(f"temp_scaling optimal_T:{opt_temp:.2f} "
+                 f"{'(manual)' if args.temp_calib > 0 else '(auto)'} "
+                 f"time:{1000.0 * (time.perf_counter() - t_temp):.0f}ms")
+            
+            # Final eval with optimal temperature
+            t_loss, t_bpb = eval_val(args, model, rank, world_size, device,
+                                      val_tokens, temperature=opt_temp, bpe_luts=bpe_luts)
+            log0(f"final_temped val_loss:{t_loss:.4f} val_bpb:{t_bpb:.4f} T={opt_temp:.2f}")
 
-    # Sliding window eval
-    if args.sliding_eval:
-        torch.cuda.synchronize()
-        t_sw = time.perf_counter()
-        temp = opt_temp if args.temp_scaling else 1.0
-        sw_loss, sw_bpb = eval_val_sliding(args, model, rank, world_size,
-                                            device, val_tokens,
-                                            stride=args.sliding_eval_stride,
-                                            temperature=temp, bpe_luts=bpe_luts)
-        torch.cuda.synchronize()
-        log0(f"final_sliding val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} "
-             f"(stride={args.sliding_eval_stride}, T={temp:.2f}) "
-             f"time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms")
+        # Sliding window eval
+        if args.sliding_eval:
+            torch.cuda.synchronize()
+            t_sw = time.perf_counter()
+            temp = opt_temp if args.temp_scaling else 1.0
+            sw_loss, sw_bpb = eval_val_sliding(args, model, rank, world_size,
+                                                device, val_tokens,
+                                                stride=args.sliding_eval_stride,
+                                                temperature=temp, bpe_luts=bpe_luts)
+            torch.cuda.synchronize()
+            log0(f"final_sliding val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} "
+                 f"(stride={args.sliding_eval_stride}, T={temp:.2f}) "
+                 f"time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms")
+    elif master:
+        log0("post_eval skipped (SKIP_POST_EVAL=1)")
 
     if distributed:
         dist.destroy_process_group()

@@ -3,6 +3,8 @@
 
 A LeWorldModel implementation in combination with Mamba2 SSM and U-Nets to the text field, specifically for this challenge and its bpb evaluation. 
 
+Reference contest baseline: [Simple Baseline](https://github.com/openai/parameter-golf/blob/main/records/track_10min_16mb/2026-03-17_NaiveBaseline/README.md). It is the track's 10-minute 8xH100 SP1024 reference run, so it is a comparison point rather than a strict tokenizer-matched baseline for this BPE8192 record.
+
 | Config | Sliding BPB | Standard BPB | Artifact | Compute |
 |--------|-------------|-------------|----------|---------|
 | BPE best (100k steps, 2.7h) | **1.2064** | 1.2235 | 15.75 MB | 8xH100 SXM |
