@@ -14,6 +14,21 @@ Ideally, we'd allow for submissions to use arbitrary computational resources. Bu
 We also know compute is expensive, so **OpenAI is sponsoring $1,000,000 in compute credits** to help people get started training their models. To request a compute grant, use this form: [Request a Compute Grant](https://openai.com/index/parameter-golf/#credit-form).
 When requesting compute, please make sure you choose the appropriate level, write sufficient justification, and **submit with an email tied to a OpenAI / ChatGPT account**.
 
+## RWKV-7 Fork
+
+This fork adds a local RWKV-7 version of the LeWM + SIGReg record. The full implementation and launcher scripts are in [the record folder](records/track_non_record_16mb/2026-03-26_37M_LeWM_Jepa_Mamba2_10L_UNet_INT4FP8QAT_Brotli/README.md).
+
+| Run | Backbone | Sliding BPB | Standard BPB | Artifact | Notes |
+|-----|---------|------------:|-------------:|---------:|------|
+| RWKV-7 local 4090 proxy | RWKV-7 | 1.2036 | 1.2651 | 14.95 MB | BPE8192, same 16MB cap |
+| Original Mamba2 record | Mamba2 | 1.2566 | 1.2721 | 15.50 MB | 8xH100 SXM reference |
+
+Architecture summary:
+
+- The sequence mixer in this fork is RWKV-7, not a transformer backbone.
+- The JEPA heads, U-Net skip routing, SIGReg, INT4+FP8 QAT, and Brotli compression stay in place.
+- The comparable local setup is the single-GPU launcher `run_record_rwkv_d576_l10_e304_bpe8192_sig0125.sh`.
+
 ## Participant Form
 
 If you enjoy solving very difficult technical problems, please introduce yourself via the [Challenge Participant Form](https://jobs.ashbyhq.com/openai/form/open-ai-challenge-parameter-golf). It helps us attribute challenge submissions and reach out about opportunities with OpenAI. _Completing the form is not required to participate._
