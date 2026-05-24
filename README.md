@@ -3,6 +3,22 @@
 <br>
 <br>
 
+## RWKV-7 Fork
+
+This fork adds a local RWKV-7 version of the LeWM + SIGReg record. The full implementation and launcher scripts are in [the record folder](records/track_non_record_16mb/2026-03-26_37M_LeWM_Jepa_Mamba2_10L_UNet_INT4FP8QAT_Brotli/README.md).
+
+| Run | Backbone | Sliding BPB | Standard BPB | Artifact | Notes |
+|-----|---------|------------:|-------------:|---------:|------|
+| RWKV-7 local 4090 proxy | RWKV-7 | 1.2036 | 1.2651 | 14.95 MB | BPE8192, same 6,090-step token budget |
+| Original Mamba2 record | Mamba2 | 1.2566 | 1.2721 | 15.50 MB | 8xH100 SXM reference |
+
+Architecture summary:
+
+- The sequence mixer in this fork is RWKV-7, not a transformer backbone.
+- The JEPA heads, U-Net skip routing, SIGReg, INT4+FP8 QAT, and Brotli compression stay in place.
+- The comparable local setup is the single-GPU launcher `run_record_rwkv_d576_l10_e304_bpe8192_sig0125.sh`.
+- The optional FLOPs proxy launcher is `run_record_flops_rwkv_d576_l10_sp1024.sh`; it matches train parameter-token budget, not exact FLOPs.
+
 **OpenAI Model Craft Challenge: Parameter Golf** is a challenge to train the best language model that fits in a 16MB artifact and trains in under 10 minutes on 8xH100s, evaluated by compression on the FineWeb validation set (tokenizer-agnostic, bits per byte).
 
 This challenge is heavily inspired by the [NanoGPT Speedrunning](https://github.com/KellerJordan/modded-nanogpt) challenge, where participants compete to train a model that reaches 3.28 FineWeb validation loss as quickly as possible. We're excited to see how optimizing for a parameter-constrained setting pushes people toward unique architectures (test-time compute, aggressive parameter tying, depth recurrence, low-rank training, ...), compression schemes (low precision, QAT, bitnets, novel tokenizers, ...), and other creative submissions (test-time training, long context, megakernels ...). 
@@ -13,21 +29,6 @@ Ideally, we'd allow for submissions to use arbitrary computational resources. Bu
 
 We also know compute is expensive, so **OpenAI is sponsoring $1,000,000 in compute credits** to help people get started training their models. To request a compute grant, use this form: [Request a Compute Grant](https://openai.com/index/parameter-golf/#credit-form).
 When requesting compute, please make sure you choose the appropriate level, write sufficient justification, and **submit with an email tied to a OpenAI / ChatGPT account**.
-
-## RWKV-7 Fork
-
-This fork adds a local RWKV-7 version of the LeWM + SIGReg record. The full implementation and launcher scripts are in [the record folder](records/track_non_record_16mb/2026-03-26_37M_LeWM_Jepa_Mamba2_10L_UNet_INT4FP8QAT_Brotli/README.md).
-
-| Run | Backbone | Sliding BPB | Standard BPB | Artifact | Notes |
-|-----|---------|------------:|-------------:|---------:|------|
-| RWKV-7 local 4090 proxy | RWKV-7 | 1.2036 | 1.2651 | 14.95 MB | BPE8192, same 16MB cap |
-| Original Mamba2 record | Mamba2 | 1.2566 | 1.2721 | 15.50 MB | 8xH100 SXM reference |
-
-Architecture summary:
-
-- The sequence mixer in this fork is RWKV-7, not a transformer backbone.
-- The JEPA heads, U-Net skip routing, SIGReg, INT4+FP8 QAT, and Brotli compression stay in place.
-- The comparable local setup is the single-GPU launcher `run_record_rwkv_d576_l10_e304_bpe8192_sig0125.sh`.
 
 ## Participant Form
 
